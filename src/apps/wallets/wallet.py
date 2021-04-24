@@ -2,11 +2,12 @@ from app import AppError
 from platform import maybe_mkdir, delete_recursively
 import json
 from bitcoin import ec, hashes, script
-from bitcoin.networks import NETWORKS
+from bitcoin.liquid.networks import NETWORKS
 from bitcoin.psbt import DerivationPath
-from bitcoin.descriptor import Descriptor
+from bitcoin.liquid.descriptor import LDescriptor as Descriptor
 from bitcoin.descriptor.arguments import AllowedDerivation
 from bitcoin.transaction import SIGHASH
+from bitcoin.liquid.addresses import address as liquid_address
 import hashlib
 from .screens import WalletScreen, WalletInfoScreen
 from .commands import DELETE, EDIT, MENU, INFO
@@ -105,26 +106,29 @@ class Wallet:
         delete_recursively(self.path, include_self=True)
 
     def get_address(self, idx: int, network: str, branch_index=0):
-        sc, gap = self.script_pubkey([int(branch_index), idx])
-        return sc.address(NETWORKS[network]), gap
+        desc, gap = self.derive_descriptor([branch_index, idx])
+        return desc.address(NETWORKS[network]), gap
 
     def script_pubkey(self, derivation: list):
         """Returns script_pubkey and gap limit"""
+        desc, gap = self.derive_descriptor(derivation)
+        return desc.script_pubkey(), gap
+
+    def derive_descriptor(self, derivation: list):
         # derivation can be only two elements
         branch_idx, idx = derivation
         if branch_idx < 0 or branch_idx >= self.descriptor.num_branches:
             raise WalletError("Invalid branch index %d - can be between 0 and %d" % (branch_idx, self.descriptor.num_branches))
         if idx < 0 or idx >= 0x80000000:
             raise WalletError("Invalid index %d" % idx)
-        sc = self.descriptor.derive(idx, branch_index=branch_idx).script_pubkey()
-        return sc, self.gaps[branch_idx]
+        return self.descriptor.derive(idx, branch_index=branch_idx), self.gaps[branch_idx]
 
     @property
     def fingerprint(self):
         """Fingerprint of the wallet - hash160(descriptor)"""
         return hashes.hash160(str(self.descriptor))[:4]
 
-    def owns(self, tx_out, bip32_derivations, script=None):
+    def owns(self, tx_out, bip32_derivations, script=None, blinding_pubkey=None):
         """
         Checks that psbt scope belongs to the wallet.
         """
@@ -141,6 +145,10 @@ class Wallet:
             return False
         # check that script_pubkey matches
         sc, _ = self.script_pubkey(derivation)
+        if blinding_pubkey is not None:
+            branch_idx, idx = derivation
+            addr, _ = self.get_address(idx, 'liquidv1', branch_index=branch_idx)
+            return addr == liquid_address(sc, blinding_pubkey)
         return sc == tx_out.script_pubkey
 
     def get_derivation(self, bip32_derivations):

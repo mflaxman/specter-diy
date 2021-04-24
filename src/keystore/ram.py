@@ -5,11 +5,12 @@ from rng import get_random_bytes
 import hashlib
 import hmac
 from bitcoin import ec, bip39, bip32
+from bitcoin.liquid import blip32, slip77
 from bitcoin.transaction import SIGHASH
 from helpers import aead_encrypt, aead_decrypt, tagged_hash
 import secp256k1
 from gui.screens import Alert, PinScreen, MnemonicScreen, Prompt
-
+from binascii import hexlify
 
 class RAMKeyStore(KeyStore):
     """
@@ -31,6 +32,14 @@ class RAMKeyStore(KeyStore):
         self.root = None
         # root fingerprint
         self.fingerprint = None
+        # blinding root
+        self.blinding_root = None
+        # blinding fingerprint
+        self.blinding_fingerprint = None
+        # slip77 blinding key
+        self.slip77_key = None
+        # user key (different for internal flash / smartcard)
+        self.userkey = None
         # private key at path m/0x1D'
         # used to encrypt & authenticate data
         # specific to this root key
@@ -55,12 +64,17 @@ class RAMKeyStore(KeyStore):
             self.show_loader(title="Generating keys...")
         """Load mnemonic and password and create root key"""
         if mnemonic is not None:
-            self.mnemonic = mnemonic.strip()
-            if not bip39.mnemonic_is_valid(self.mnemonic):
+            if not bip39.mnemonic_is_valid(mnemonic):
                 raise KeyStoreError("Invalid mnemonic")
+            self.mnemonic = mnemonic.strip()
         seed = bip39.mnemonic_to_seed(self.mnemonic, password)
         self.root = bip32.HDKey.from_seed(seed)
         self.fingerprint = self.root.child(0).fingerprint
+        # liquid blinding keys
+        self.blinding_root = blip32.BlindingHDKey.from_seed(seed)
+        self.blinding_fingerprint = self.blinding_root.child(0).fingerprint
+        # slip 77 blinding key
+        self.slip77_key = slip77.master_blinding_from_seed(seed)
         # id key to sign and encrypt wallet files
         # stored on untrusted external chip
         self.idkey = self.root.child(0x1D, hardened=True).key.serialize()
@@ -107,6 +121,11 @@ class RAMKeyStore(KeyStore):
             raise KeyStoreError("Keystore is not ready")
         return self.root.derive(path).to_public()
 
+    def get_blinding_xprv(self, path):
+        if self.is_locked or self.blinding_root is None:
+            raise KeyStoreError("Keystore is not ready")
+        return self.blinding_root.derive(path)
+
     def owns(self, key):
         if key.fingerprint is not None and key.fingerprint != self.fingerprint:
             return False
@@ -127,6 +146,11 @@ class RAMKeyStore(KeyStore):
                 self.secret = f.read()
         except:
             self.secret = self.create_new_secret(path)
+
+    @property
+    def uid(self):
+        if self.userkey:
+            return hexlify(tagged_hash("uid", self.userkey)[:4]).decode()
 
     def create_new_secret(self, path):
         """Generate new secret and default PIN config"""
@@ -231,6 +255,7 @@ class RAMKeyStore(KeyStore):
         # set encryption secret somehow mb save it
         # don't use this approach, it's just for reference
         self.enc_secret = tagged_hash("enc", self.secret)
+        self.userkey = tagged_hash("userkey", self.secret)
 
     def _change_pin(self, old_pin, new_pin):
         """Implement PIN change function"""

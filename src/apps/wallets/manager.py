@@ -1,20 +1,26 @@
 from app import BaseApp
 from gui.screens import Menu, InputScreen, Prompt, TransactionScreen
 from .screens import WalletScreen, ConfirmWalletScreen
+from gui.common import format_addr
 
 import platform
 import os
+import secp256k1
+import hashlib
 from binascii import hexlify, unhexlify, a2b_base64, b2a_base64
 from bitcoin.psbt import PSBT, DerivationPath
-from bitcoin.networks import NETWORKS
-from bitcoin import script, bip32
-from bitcoin.transaction import SIGHASH
+from bitcoin.liquid.pset import PSET
+from bitcoin.liquid.networks import NETWORKS
+from bitcoin import script, bip32, ec, compact
+from bitcoin.liquid.transaction import LSIGHASH as SIGHASH
+from bitcoin.liquid.addresses import address as liquid_address
 from .wallet import WalletError, Wallet
 from .commands import DELETE, EDIT
 from io import BytesIO
 from bcur import bcur_encode, bcur_decode, bcur_decode_stream, bcur_encode_stream
-from helpers import a2b_base64_stream
+from helpers import a2b_base64_stream, is_liquid
 import gc
+import json
 
 SIGN_PSBT = 0x01
 ADD_WALLET = 0x02
@@ -26,6 +32,8 @@ VERIFY_ADDRESS = 0x03
 DERIVE_ADDRESS = 0x04
 # sign psbt transaction encoded in bc-ur format
 SIGN_BCUR = 0x05
+ADD_ASSET = 0x06
+DUMP_ASSETS = 0x07
 
 BASE64_STREAM = 0x64
 RAW_STREAM = 0xFF
@@ -34,10 +42,31 @@ SIGHASH_NAMES = {
     SIGHASH.ALL: "ALL",
     SIGHASH.NONE: "NONE",
     SIGHASH.SINGLE: "SINGLE",
-    (SIGHASH.ALL | SIGHASH.ANYONECANPAY): "ALL | ANYONECANPAY",
-    (SIGHASH.NONE | SIGHASH.ANYONECANPAY): "NONE | ANYONECANPAY",
-    (SIGHASH.SINGLE | SIGHASH.ANYONECANPAY): "SINGLE | ANYONECANPAY",
 }
+# add sighash | anyonecanpay
+for sh in list(SIGHASH_NAMES):
+    SIGHASH_NAMES[sh | SIGHASH.ANYONECANPAY] = SIGHASH_NAMES[sh] + " | ANYONECANPAY"
+# add sighash | rangeproof
+for sh in list(SIGHASH_NAMES):
+    SIGHASH_NAMES[sh | SIGHASH.RANGEPROOF] = SIGHASH_NAMES[sh] + " | RANGEPROOF"
+
+def get_address(vout, psbtout, network):
+    """Helper function to get an address for every output"""
+    if is_liquid(network):
+        # liquid fee
+        if vout.script_pubkey.data == b"":
+            return "Fee"
+        if psbtout.blinding_pubkey is not None:
+            # TODO: check rangeproof if it's present,
+            # otherwise generate it ourselves if sighash is | RANGEPROOF
+            bpub = ec.PublicKey.parse(psbtout.blinding_pubkey)
+            return liquid_address(vout.script_pubkey, bpub, network)
+    # finally just return bitcoin address or unconfidential
+    try:
+        return vout.script_pubkey.address(NETWORKS[network])
+    except:
+        # if script doesn't have address representation
+        return hexlify(vout.script_pubkey.data)
 
 class WalletManager(BaseApp):
     """
@@ -47,7 +76,9 @@ class WalletManager(BaseApp):
     """
 
     button = "Wallets"
-    WALLETS = [Wallet]
+    assets = {
+        bytes(reversed(unhexlify("230164e2d3ff2c88cc0739e56a3501c979fe131fd07944e8a609323ef26c6918"))): "tBTC",
+    }
 
     def __init__(self, path):
         self.root_path = path
@@ -73,14 +104,7 @@ class WalletManager(BaseApp):
         if self.wallets is None or len(self.wallets) == 0:
             w = self.create_default_wallet(path=self.path + "/0")
             self.wallets = [w]
-
-    @classmethod
-    def register(cls, walletcls):
-        """Registers an additional wallet class"""
-        # check if it's already there
-        if walletcls in cls.WALLETS:
-            return
-        cls.WALLETS.append(walletcls)
+        self.load_assets()
 
     async def menu(self, show_screen):
         buttons = [(None, "Your wallets")]
@@ -130,6 +154,10 @@ class WalletManager(BaseApp):
                 return DERIVE_ADDRESS, stream
             elif prefix == b"addwallet":
                 return ADD_WALLET, stream
+            elif is_liquid(self.network) and prefix == b"addasset":
+                return ADD_ASSET, stream
+            elif is_liquid(self.network) and prefix == b"dumpassets":
+                return DUMP_ASSETS, stream
             else:
                 return None, None
         # if not - we get data any without prefix
@@ -140,16 +168,15 @@ class WalletManager(BaseApp):
             # rewind
             stream.seek(0)
             return SIGN_BCUR, stream
-        if data[:4] == b"cHNi":
-            try:
-                psbt = a2b_base64(data)
-                if psbt[:5] != b"psbt\xff":
-                    return None, None
-                # rewind
-                stream.seek(0)
-                return SIGN_PSBT, stream
-            except:
-                pass
+        try:
+            psbt = a2b_base64(data)
+            if psbt[:len(PSBT.MAGIC)] not in [PSBT.MAGIC, PSET.MAGIC]:
+                return None, None
+            # rewind
+            stream.seek(0)
+            return SIGN_PSBT, stream
+        except:
+            pass
         # probably wallet descriptor
         if b"&" in data and b"?" not in data:
             # rewind
@@ -170,9 +197,9 @@ class WalletManager(BaseApp):
         cmd, stream = self.parse_stream(stream)
         if cmd == SIGN_PSBT:
             encoding = BASE64_STREAM
-            if stream.read(5) == b"psbt\xff":
+            if stream.read(len(PSBT.MAGIC)) in [PSBT.MAGIC, PSET.MAGIC]:
                 encoding = RAW_STREAM
-            stream.seek(-5, 1)
+            stream.seek(-len(PSBT.MAGIC), 1)
             res = await self.sign_psbt(stream, show_screen, encoding)
             if res is not None:
                 obj = {
@@ -246,33 +273,57 @@ class WalletManager(BaseApp):
                 paths, script_type, redeem_script, show_screen=show_screen
             )
             return BytesIO(res), {}
+        elif cmd == ADD_ASSET:
+            arr = stream.read().decode().split(" ")
+            if len(arr) != 2:
+                raise WalletError("Invalid number of arguments. Usage: addasset <hex_asset> asset_lbl")
+            hexasset, assetlbl = arr
+            if await show_screen(Prompt("Import asset?",
+                    "Asset:\n\n"+format_addr(hexasset, letters=8, words=2)+"\n\nLabel: "+assetlbl)):
+                asset = bytes(reversed(unhexlify(hexasset)))
+                self.assets[asset] = assetlbl
+                self.save_assets()
+            return BytesIO(b"success"), {}
+        elif cmd == DUMP_ASSETS:
+            return BytesIO(self.assets_json()), {}
         else:
             raise WalletError("Unknown command")
 
     async def sign_psbt(self, stream, show_screen, encoding=BASE64_STREAM):
-        if encoding == BASE64_STREAM:
-            with open(self.tempdir+"/raw", "wb") as f:
-                # read in chunks, write to ram file
-                a2b_base64_stream(stream, f)
-            with open(self.tempdir+"/raw", "rb") as f:
-                psbt = PSBT.read_from(f, compress=True)
-            # cleanup
-            platform.delete_recursively(self.tempdir)
-        else:
-            psbt = PSBT.read_from(stream, compress=True)
+        PSBTClass = PSET if is_liquid(self.network) else PSBT
+        # we sign rangeproofs by default as well, to verify addresses
+        sighash = (SIGHASH.ALL | SIGHASH.RANGEPROOF) if is_liquid(self.network) else SIGHASH.ALL
+
+        try:
+            if encoding == BASE64_STREAM:
+                with open(self.tempdir+"/raw", "wb") as f:
+                    # read in chunks, write to ram file
+                    a2b_base64_stream(stream, f)
+                with open(self.tempdir+"/raw", "rb") as f:
+                    psbt = PSBTClass.read_from(f, compress=True)
+                # cleanup
+                platform.delete_recursively(self.tempdir)
+            else:
+                psbt = PSBTClass.read_from(stream, compress=True)
+        except Exception as e:
+            # TODO: not very nice, better to use custom exception on magic
+            if e.args[0] == "Invalid PSBT magic":
+                raise WalletError("Wrong transaction type! Switch to %s network to sign PSBT!" % ("Bitcoin" if is_liquid(self.network) else "Liquid"))
+            else:
+                raise e
+        psbt.verify()
         # check if all utxos are there and if there are custom sighashes
-        sighash = SIGHASH.ALL
         custom_sighashes = []
         for i, inp in enumerate(psbt.inputs):
             if (not inp.is_verified) and inp.witness_utxo is None and inp.non_witness_utxo is None:
                 raise WalletError("Invalid PSBT - missing previous transaction")
-            if inp.sighash_type and inp.sighash_type != SIGHASH.ALL:
+            if inp.sighash_type and inp.sighash_type != sighash:
                 custom_sighashes.append((i, inp.sighash_type))
 
         if len(custom_sighashes) > 0:
             txt = [("Input %d: " % i) + SIGHASH_NAMES[sh]
                     for (i, sh) in custom_sighashes]
-            canceltxt = "Only sign ALL" if len(custom_sighashes) != len(psbt.inputs) else "Cancel"
+            canceltxt = ("Only sign %s" % SIGHASH_NAMES[sighash]) if len(custom_sighashes) != len(psbt.inputs) else "Cancel"
             confirm = await show_screen(Prompt("Warning!",
                 "\nCustom SIGHASH flags are used!\n\n"+"\n".join(txt),
                 confirm_text="Sign anyway", cancel_text=canceltxt
@@ -284,6 +335,27 @@ class WalletManager(BaseApp):
                     # nothing to sign
                     return
         wallets, meta = self.parse_psbt(psbt=psbt)
+        if len(meta["unknown_assets"]) > 0:
+            scr = Prompt(
+                "Warning!",
+                "\nUnknown asset in the transaction!\n\n\n"
+                "Do you want to label them?\n"
+                "Otherwise they will be rendered as \"???\"",
+            )
+            if await show_screen(scr):
+                for asset in meta["unknown_assets"]:
+                    # return False if the user cancelled
+                    scr = InputScreen("Asset\n\n"+format_addr(hexlify(bytes(reversed(asset))).decode(), letters=8, words=2),
+                                note="\nChoose a label for unknown asset.\nBetter to keep it short, like LBTC or LDIY")
+                    scr.ta.set_pos(190, 350)
+                    scr.ta.set_width(100)
+                    lbl = await show_screen(scr)
+                    if lbl is None:
+                        return
+                    else:
+                        self.assets[asset] = lbl
+                self.save_assets()
+                wallets, meta = self.parse_psbt(psbt=psbt)
         # there is an unknown wallet
         # wallet is a list of tuples: (wallet, amount)
         if None in [w[0] for w in wallets]:
@@ -308,6 +380,46 @@ class WalletManager(BaseApp):
         res = await show_screen(TransactionScreen(title, meta))
         if res:
             self.show_loader(title="Signing transaction...")
+            if is_liquid(self.network):
+                h = hashlib.sha256()
+                # fill missing data
+                gc.collect()
+                for i, out in enumerate(psbt.outputs):
+                    self.show_loader(title="Rangeproof %d..." % i)
+                    # skip non-confidential
+                    if b'\xfc\x07specter\x01' not in out.unknown:
+                        if out.range_proof:
+                            h.update(compact.to_bytes(len(proof)))
+                            h.update(proof)
+                            h.update(compact.to_bytes(len(out.surjection_proof)))
+                            h.update(out.surjection_proof)
+                        else:
+                            h.update(b"\x00\x00")
+                        continue
+                    nonce = out.unknown[b'\xfc\x07specter\x01']
+                    if out.nonce_commitment:
+                        assert out.nonce_commitment == ec.PrivateKey(nonce).sec()
+                    else:
+                        out.nonce_commitment = ec.PrivateKey(nonce).sec()
+                    pub = secp256k1.ec_pubkey_parse(out.blinding_pubkey)
+                    secp256k1.ec_pubkey_tweak_mul(pub, nonce)
+                    sec = secp256k1.ec_pubkey_serialize(pub)
+                    ecdh_nonce = hashlib.sha256(hashlib.sha256(sec).digest()).digest()
+                    vout = psbt.tx.vout[i]
+                    proof = secp256k1.rangeproof_sign(
+                        ecdh_nonce, vout.value, secp256k1.pedersen_commitment_parse(out.value_commitment),
+                        out.value_blinding_factor, vout.asset[1:]+out.asset_blinding_factor,
+                        vout.script_pubkey.data, secp256k1.generator_parse(out.asset_commitment))
+                    h.update(compact.to_bytes(len(proof)))
+                    h.update(proof)
+                    h.update(compact.to_bytes(len(out.surjection_proof)))
+                    h.update(out.surjection_proof)
+                    out.surjection_proof = None
+                    del proof
+                    gc.collect()
+                psbt.tx._hash_outputs_rangeproofs = h.digest()
+
+            self.show_loader(title="Signing now..." % i)
             sigsStart = 0
             for i, inp in enumerate(psbt.inputs):
                 sigsStart += len(list(inp.partial_sigs.keys()))
@@ -322,7 +434,7 @@ class WalletManager(BaseApp):
                     w.sign_psbt(psbt, sighash)
             self.keystore.sign_psbt(psbt, sighash)
             # remove unnecessary stuff:
-            out_psbt = PSBT(psbt.tx)
+            out_psbt = PSBTClass(psbt.tx)
             sigsEnd = 0
             for i, inp in enumerate(psbt.inputs):
                 sigsEnd += len(list(inp.partial_sigs.keys()))
@@ -330,13 +442,39 @@ class WalletManager(BaseApp):
             del psbt
             gc.collect()
             if sigsEnd == sigsStart:
-                raise WalletError("We didn't add any signatures!\n\nMaybe you forgot to import the wallet?\n\nScan the wallet descriptor to import it.")
+                raise WalletError("We didn't add any signatures!\n\n"
+                                  "Maybe you forgot to import the wallet?\n\n"
+                                  "Scan the wallet descriptor to import it.")
             if encoding == BASE64_STREAM:
                 # TODO: also use ram file
                 txt = b2a_base64(out_psbt.serialize()).decode().strip()
             else:
                 txt = out_psbt.serialize()
             return BytesIO(txt)
+
+    def assets_json(self):
+        assets = {}
+        # no support for bytes...
+        for asset in self.assets:
+            assets[hexlify(bytes(reversed(asset))).decode()] = self.assets[asset]
+        return json.dumps(assets)
+
+    def save_assets(self):
+        path = self.root_path + "/uid" + self.keystore.uid
+        platform.maybe_mkdir(path)
+        assets = self.assets_json()
+        self.keystore.save_aead(path + "/" + self.network, plaintext=assets.encode(), key=self.keystore.userkey)
+
+    def load_assets(self):
+        path = self.root_path + "/" + self.keystore.uid
+        platform.maybe_mkdir(path)
+        if platform.file_exists(path + "/" + self.network):
+            _, assets = self.keystore.load_aead(path + "/" + self.network, key=self.keystore.userkey)
+            assets = json.loads(assets.decode())
+            # no support for bytes...
+            for asset in assets:
+                self.assets[bytes(reversed(unhexlify(asset)))] = assets[asset]
+
 
     async def confirm_new_wallet(self, w, show_screen):
         keys = w.get_key_dicts(self.network)
@@ -353,6 +491,7 @@ class WalletManager(BaseApp):
     async def showaddr(
         self, paths: list, script_type: str, redeem_script=None, show_screen=None
     ) -> str:
+        # TODO: update for liquid
         net = NETWORKS[self.network]
         if redeem_script is not None:
             redeem_script = script.Script(unhexlify(redeem_script))
@@ -411,33 +550,34 @@ class WalletManager(BaseApp):
 
     def load_wallet(self, path):
         """Loads a wallet with particular id"""
-        w = None
-        # going through all wallet classes and trying to load
-        # first we verify descriptor sig in the folder
-        for walletcls in self.WALLETS:
-            try:
-                # pass path and key for verification
-                w = walletcls.from_path(path, self.keystore)
-                # if fails - we continue, otherwise - we are done
-                break
-            except Exception as e:
-                pass
-        # if we failed to load -> delete folder and throw an error
-        if w is None:
+        try:
+            # pass path and key for verification
+            w = Wallet.from_path(path, self.keystore)
+        except Exception as e:
+            # if we failed to load -> delete folder and throw an error
             platform.delete_recursively(path, include_self=True)
-            raise WalletError("Can't load wallet from %s" % path)
+            raise WalletError("Can't load wallet from %s\n\n:%s" % (path, str(e)))
         return w
 
     def create_default_wallet(self, path):
         """Creates default p2wpkh wallet with name `Default`"""
         der = "m/84h/%dh/0h" % NETWORKS[self.network]["bip32"]
         xpub = self.keystore.get_xpub(der)
-        desc = "Default&wpkh([%s%s]%s)" % (
+        desc = "wpkh([%s%s]%s/{0,1}/*)" % (
             hexlify(self.keystore.fingerprint).decode(),
             der[1:],
             xpub.to_base58(NETWORKS[self.network]["xpub"]),
         )
-        w = Wallet.parse(desc, path)
+        if is_liquid(self.network):
+            # bprv = self.keystore.get_blinding_xprv(der)
+            # bkey = "[%s%s]%s/{0,1}/*" % (
+            #     hexlify(self.keystore.blinding_fingerprint).decode(),
+            #     der[1:],
+            #     bprv.to_base58(NETWORKS[self.network]["xprv"]),
+            # )
+            # desc = "blinded(%s,%s)" % (bkey, desc)
+            desc = "blinded(slip77(%s),%s)" % (self.keystore.slip77_key, desc)
+        w = Wallet.parse("Default&"+desc, path)
         # pass keystore to encrypt data
         w.save(self.keystore)
         platform.sync()
@@ -447,16 +587,11 @@ class WalletManager(BaseApp):
         w = None
         # trying to find a correct wallet type
         errors = []
-        for walletcls in self.WALLETS:
-            try:
-                w = walletcls.parse(desc)
-                # if fails - we continue, otherwise - we are done
-                break
-            except Exception as e:
-                # raise if only one wallet class is available (most cases)
-                errors.append(e)
-        if w is None:
-            raise WalletError("Can't detect matching wallet type\n"+"\n".join([str(e) for e in errors]))
+        try:
+            w = Wallet.parse(desc)
+        except Exception as e:
+            # raise if only one wallet class is available (most cases)
+            raise WalletError("Can't parse descriptor\n\n%s" % str(e))
         if str(w.descriptor) in [str(ww.descriptor) for ww in self.wallets]:
             raise WalletError("Wallet with this descriptor already exists")
         if not w.check_network(NETWORKS[self.network]):
@@ -483,6 +618,7 @@ class WalletManager(BaseApp):
         w.wipe()
 
     def find_wallet_from_address(self, addr: str, paths=None, index=None):
+        # TODO: update for liquid
         if index is not None:
             for w in self.wallets:
                 a, _ = w.get_address(index, self.network)
@@ -517,32 +653,46 @@ class WalletManager(BaseApp):
         amounts = []
 
         # calculate fee
-        fee = sum([psbt.utxo(i).value for i in range(len(psbt.inputs))])
-        fee -= sum([out.value for out in psbt.tx.vout])
+        fee = psbt.fee()
+
+        if is_liquid(self.network):
+            default_asset = None
+        else:
+            default_asset = "BTC" if self.network == "main" else "tBTC"
 
         # metadata for GUI
         meta = {
-            "inputs": [{} for i in psbt.tx.vin],
+            "inputs": [{"asset": default_asset} for inp in psbt.inputs],
             "outputs": [
                 {
-                    "address": out.script_pubkey.address(NETWORKS[self.network]),
+                    "address": get_address(out, psbt.outputs[i], NETWORKS[self.network]),
                     "value": out.value,
                     "change": False,
+                    "asset": default_asset,
                 }
-                for out in psbt.tx.vout
+                for i, out in enumerate(psbt.tx.vout)
             ],
             "fee": fee,
             "warnings": [],
+            "unknown_assets": [],
         }
         # detect wallet for all inputs
         for i, inp in enumerate(psbt.inputs):
             found = False
             utxo = psbt.utxo(i)
-            meta["inputs"][i] = {
+            # value is stored in utxo for btc tx and in unblinded tx vin for liquid
+            value = utxo.value if not is_liquid(self.network) else inp.value
+            if is_liquid(self.network):
+                if inp.asset in self.assets:
+                    meta["inputs"][i]["asset"] = self.assets[inp.asset]
+                else:
+                    if inp.asset not in meta["unknown_assets"]:
+                        meta["unknown_assets"].append(inp.asset)
+            meta["inputs"][i].update({
                 "label": "Unknown wallet",
-                "value": utxo.value,
+                "value": value,
                 "sighash": SIGHASH_NAMES[inp.sighash_type or SIGHASH.ALL]
-            }
+            })
             for w in self.wallets:
                 if w.owns(psbt.utxo(i), inp.bip32_derivations, inp.witness_script or inp.redeem_script):
                     branch_idx, idx = w.get_derivation(inp.bip32_derivations)
@@ -555,19 +705,19 @@ class WalletManager(BaseApp):
                         meta["inputs"][i]["label"] += " #%d on branch %d" % (idx, branch_idx)
                     if w not in wallets:
                         wallets.append(w)
-                        amounts.append(utxo.value)
+                        amounts.append(value)
                     else:
                         idx = wallets.index(w)
-                        amounts[idx] += utxo.value
+                        amounts[idx] += value
                     found = True
                     break
             if not found:
                 if None not in wallets:
                     wallets.append(None)
-                    amounts.append(psbt.utxo(i).value)
+                    amounts.append(value)
                 else:
                     idx = wallets.index(None)
-                    amounts[idx] += psbt.utxo(i).value
+                    amounts[idx] += value
 
         if None in wallets:
             meta["warnings"].append("Unknown wallet in input!")
@@ -576,10 +726,20 @@ class WalletManager(BaseApp):
 
         # check change outputs
         for i, out in enumerate(psbt.outputs):
+            vout = psbt.tx.vout[i]
+            if is_liquid(self.network):
+                asset = vout.asset[1:]
+                if asset in self.assets:
+                    meta["outputs"][i]["asset"] = self.assets[asset]
+                else:
+                    if asset not in meta["unknown_assets"]:
+                        meta["unknown_assets"].append(asset)
+            if is_liquid(self.network) and vout.script_pubkey.data == b"":
+                continue
             for w in wallets:
                 if w is None:
                     continue
-                if w.owns(psbt.tx.vout[i], out.bip32_derivations, out.witness_script or out.redeem_script):
+                if w.owns(psbt.tx.vout[i], out.bip32_derivations, out.witness_script or out.redeem_script, ec.PublicKey.parse(out.blinding_pubkey)):
                     meta["outputs"][i]["change"] = True
                     meta["outputs"][i]["label"] = w.name
                     break
